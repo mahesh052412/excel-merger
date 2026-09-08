@@ -1,6 +1,12 @@
 import streamlit as st
 import pandas as pd
 from io import BytesIO
+import tempfile
+import subprocess
+import os
+from pathlib import Path
+import warnings
+warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Excel Merger", page_icon="📊", layout="wide")
 
@@ -17,13 +23,93 @@ with st.sidebar:
 4. Select Key Column & Value Column  
 5. Click **Merge Files**
 """)
+    st.markdown("---")
+    st.caption("Supports .xlsx, .xls + auto conversion via LibreOffice")
 
-def get_engine(filename: str):
-    """Return the correct engine based on file extension"""
-    if filename.lower().endswith(".xls"):
-        return "xlrd"          # for old Excel 97-2003
-    else:
-        return "openpyxl"      # for modern .xlsx
+
+def convert_with_libreoffice(uploaded_file):
+    """
+    Convert any spreadsheet to .xlsx using LibreOffice (most reliable method)
+    Returns path to the converted .xlsx file
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Save uploaded file
+        input_path = Path(tmpdir) / uploaded_file.name
+        with open(input_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+
+        # Run LibreOffice conversion
+        try:
+            result = subprocess.run(
+                [
+                    "soffice",
+                    "--headless",
+                    "--convert-to", "xlsx",
+                    "--outdir", tmpdir,
+                    str(input_path)
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+        except FileNotFoundError:
+            raise Exception("LibreOffice (soffice) is not installed or not in PATH.")
+
+        if result.returncode != 0:
+            raise Exception(f"LibreOffice conversion failed:\n{result.stderr}")
+
+        # Find the converted file
+        converted_files = list(Path(tmpdir).glob("*.xlsx"))
+        if not converted_files:
+            raise Exception("Conversion finished but no .xlsx file was created.")
+
+        converted_path = converted_files[0]
+
+        # Read into memory so we can return a file-like object
+        with open(converted_path, "rb") as f:
+            data = f.read()
+
+        return BytesIO(data)
+
+
+def read_excel_safe(file, sheet_name=None):
+    """
+    Try normal engines first, then LibreOffice conversion as last resort.
+    """
+    # Reset pointer
+    if hasattr(file, "seek"):
+        file.seek(0)
+
+    engines = ["openpyxl", "xlrd"]
+    last_error = None
+
+    # 1. Try normal engines
+    for engine in engines:
+        try:
+            if hasattr(file, "seek"):
+                file.seek(0)
+            if sheet_name is None:
+                return pd.ExcelFile(file, engine=engine)
+            else:
+                return pd.read_excel(file, sheet_name=sheet_name, engine=engine)
+        except Exception as e:
+            last_error = e
+            continue
+
+    # 2. Try LibreOffice conversion
+    try:
+        if hasattr(file, "seek"):
+            file.seek(0)
+        converted = convert_with_libreoffice(file)
+
+        if sheet_name is None:
+            return pd.ExcelFile(converted, engine="openpyxl")
+        else:
+            return pd.read_excel(converted, sheet_name=sheet_name, engine="openpyxl")
+    except Exception as e:
+        last_error = e
+
+    raise Exception(f"Could not read the file with any method.\nLast error: {last_error}")
 
 
 # ---------------- File Uploaders ----------------
@@ -49,11 +135,9 @@ with col2:
 # ---------------- Main Logic ----------------
 if primary_file is not None:
     try:
-        engine = get_engine(primary_file.name)
-
-        # Read all sheet names
-        xl = pd.ExcelFile(primary_file, engine=engine)
-        sheet_names = xl.sheet_names
+        with st.spinner("Reading / converting file..."):
+            xl = read_excel_safe(primary_file)
+            sheet_names = xl.sheet_names
 
         st.success(f"Primary file loaded successfully (`{primary_file.name}`)")
 
@@ -65,11 +149,10 @@ if primary_file is not None:
             index=0
         )
 
-        # Read the selected sheet
-        primary_df = pd.read_excel(primary_file, sheet_name=selected_sheet, engine=engine)
+        primary_df = read_excel_safe(primary_file, sheet_name=selected_sheet)
         all_columns = list(primary_df.columns)
 
-        st.write(f"**Sheet selected:** `{selected_sheet}` → {len(primary_df)} rows")
+        st.write(f"**Sheet selected:** `{selected_sheet}` → **{len(primary_df)}** rows")
         st.write(f"**Available columns:** {all_columns}")
 
         # Column selection
@@ -79,9 +162,12 @@ if primary_file is not None:
         with col_a:
             key_col = st.selectbox("Key Column (starting column)", all_columns, index=0)
         with col_b:
-            value_col = st.selectbox("Value Column (ending column)", all_columns, index=len(all_columns)-1)
+            value_col = st.selectbox(
+                "Value Column (ending column)",
+                all_columns,
+                index=len(all_columns) - 1 if len(all_columns) > 0 else 0
+            )
 
-        # Calculate selected columns range
         start_idx = all_columns.index(key_col)
         end_idx = all_columns.index(value_col)
         if start_idx > end_idx:
@@ -104,17 +190,12 @@ if primary_file is not None:
 
                     for file in secondary_files:
                         try:
-                            sec_engine = get_engine(file.name)
-                            sec_df = pd.read_excel(file, sheet_name=selected_sheet, engine=sec_engine)
+                            sec_df = read_excel_safe(file, sheet_name=selected_sheet)
 
                             available_cols = [c for c in selected_columns if c in sec_df.columns]
 
                             if key_col not in available_cols:
-                                skipped_files.append(f"`{file.name}` → Key column '{key_col}' missing")
-                                continue
-
-                            if not available_cols:
-                                skipped_files.append(f"`{file.name}` → No matching columns")
+                                skipped_files.append(f"`{file.name}` → Key column missing")
                                 continue
 
                             filtered = sec_df[available_cols].copy()
@@ -126,10 +207,8 @@ if primary_file is not None:
                             filtered = filtered[selected_columns]
                             all_dfs.append(filtered)
 
-                        except ValueError:
-                            skipped_files.append(f"`{file.name}` → Sheet '{selected_sheet}' not found")
                         except Exception as e:
-                            skipped_files.append(f"`{file.name}` → Error: {e}")
+                            skipped_files.append(f"`{file.name}` → {e}")
 
                     if skipped_files:
                         st.warning("Some files were skipped:")
@@ -145,7 +224,6 @@ if primary_file is not None:
                     st.subheader("Preview of Merged Data")
                     st.dataframe(final_df, use_container_width=True)
 
-                    # Download
                     buffer = BytesIO()
                     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                         final_df.to_excel(writer, index=False, sheet_name="Merged")
@@ -160,7 +238,8 @@ if primary_file is not None:
                     )
 
     except Exception as e:
-        st.error(f"Error reading Primary file: {e}")
+        st.error(f"Error reading Primary file:\n{e}")
+        st.info("Make sure LibreOffice is installed. You can also convert the file manually to .xlsx.")
 
 else:
     st.info("👆 Please upload a Primary Excel file to begin.")
