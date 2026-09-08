@@ -18,6 +18,14 @@ with st.sidebar:
 5. Click **Merge Files**
 """)
 
+def get_engine(filename: str):
+    """Return the correct engine based on file extension"""
+    if filename.lower().endswith(".xls"):
+        return "xlrd"          # for old Excel 97-2003
+    else:
+        return "openpyxl"      # for modern .xlsx
+
+
 # ---------------- File Uploaders ----------------
 col1, col2 = st.columns(2)
 
@@ -41,12 +49,14 @@ with col2:
 # ---------------- Main Logic ----------------
 if primary_file is not None:
     try:
-        # First read all sheet names from primary file
-        xl = pd.ExcelFile(primary_file)
+        engine = get_engine(primary_file.name)
+
+        # Read all sheet names
+        xl = pd.ExcelFile(primary_file, engine=engine)
         sheet_names = xl.sheet_names
 
-        st.success(f"Primary file loaded successfully")
-        
+        st.success(f"Primary file loaded successfully (`{primary_file.name}`)")
+
         # Sheet selection
         st.subheader("📄 Select Sheet")
         selected_sheet = st.selectbox(
@@ -55,8 +65,8 @@ if primary_file is not None:
             index=0
         )
 
-        # Now read the selected sheet
-        primary_df = pd.read_excel(primary_file, sheet_name=selected_sheet)
+        # Read the selected sheet
+        primary_df = pd.read_excel(primary_file, sheet_name=selected_sheet, engine=engine)
         all_columns = list(primary_df.columns)
 
         st.write(f"**Sheet selected:** `{selected_sheet}` → {len(primary_df)} rows")
@@ -88,18 +98,15 @@ if primary_file is not None:
             else:
                 with st.spinner("Merging files..."):
 
-                    # Primary data
                     primary_subset = primary_df[selected_columns].copy()
                     all_dfs = [primary_subset]
-
                     skipped_files = []
 
-                    # Process secondary files
                     for file in secondary_files:
                         try:
-                            # Try to read the same sheet name
-                            sec_df = pd.read_excel(file, sheet_name=selected_sheet)
-                            
+                            sec_engine = get_engine(file.name)
+                            sec_df = pd.read_excel(file, sheet_name=selected_sheet, engine=sec_engine)
+
                             available_cols = [c for c in selected_columns if c in sec_df.columns]
 
                             if key_col not in available_cols:
@@ -112,7 +119,6 @@ if primary_file is not None:
 
                             filtered = sec_df[available_cols].copy()
 
-                            # Add missing columns as blank
                             for col in selected_columns:
                                 if col not in filtered.columns:
                                     filtered[col] = pd.NA
@@ -125,24 +131,21 @@ if primary_file is not None:
                         except Exception as e:
                             skipped_files.append(f"`{file.name}` → Error: {e}")
 
-                    # Show skipped files if any
                     if skipped_files:
                         st.warning("Some files were skipped:")
                         for msg in skipped_files:
                             st.write(f"- {msg}")
 
-                    # Combine everything
                     final_df = pd.concat(all_dfs, ignore_index=True)
                     final_df = final_df.drop_duplicates(subset=selected_columns, keep="first")
                     final_df = final_df.sort_values(by=key_col).reset_index(drop=True)
 
                     st.success(f"✅ Merge complete! **{final_df.shape[0]} rows × {final_df.shape[1]} columns**")
 
-                    # Preview
                     st.subheader("Preview of Merged Data")
                     st.dataframe(final_df, use_container_width=True)
 
-                    # Download button
+                    # Download
                     buffer = BytesIO()
                     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                         final_df.to_excel(writer, index=False, sheet_name="Merged")
