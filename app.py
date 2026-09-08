@@ -3,15 +3,18 @@ import pandas as pd
 from io import BytesIO
 import tempfile
 import subprocess
-import os
 from pathlib import Path
 import warnings
+
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Excel Merger", page_icon="📊", layout="wide")
 
 st.title("📊 Excel File Merger")
-st.markdown("Upload one **Primary** file and multiple **Secondary** files. Select sheet + two columns — all columns between them will be merged.")
+st.markdown(
+    "Upload one **Primary** file and multiple **Secondary** files. "
+    "Select a sheet + two columns — all columns between them will be merged."
+)
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
@@ -24,21 +27,24 @@ with st.sidebar:
 5. Click **Merge Files**
 """)
     st.markdown("---")
-    st.caption("Supports .xlsx, .xls + auto conversion via LibreOffice")
+    st.caption("Supports `.xlsx`, `.xls`, `.xlsm` + auto conversion via LibreOffice")
 
 
-def convert_with_libreoffice(uploaded_file):
-    """
-    Convert any spreadsheet to .xlsx using LibreOffice (most reliable method)
-    Returns path to the converted .xlsx file
-    """
+def get_preferred_engine(filename: str) -> str:
+    """Return preferred engine based on extension."""
+    ext = Path(filename).suffix.lower()
+    if ext == ".xls":
+        return "xlrd"
+    return "openpyxl"  # .xlsx, .xlsm, etc.
+
+
+def convert_with_libreoffice(uploaded_file) -> BytesIO:
+    """Convert any spreadsheet to .xlsx using LibreOffice."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Save uploaded file
         input_path = Path(tmpdir) / uploaded_file.name
         with open(input_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
 
-        # Run LibreOffice conversion
         try:
             result = subprocess.run(
                 [
@@ -46,48 +52,54 @@ def convert_with_libreoffice(uploaded_file):
                     "--headless",
                     "--convert-to", "xlsx",
                     "--outdir", tmpdir,
-                    str(input_path)
+                    str(input_path),
                 ],
                 capture_output=True,
                 text=True,
-                timeout=60
+                timeout=90,
             )
         except FileNotFoundError:
-            raise Exception("LibreOffice (soffice) is not installed or not in PATH.")
+            raise Exception("LibreOffice (`soffice`) is not installed or not in PATH.")
 
         if result.returncode != 0:
             raise Exception(f"LibreOffice conversion failed:\n{result.stderr}")
 
-        # Find the converted file
         converted_files = list(Path(tmpdir).glob("*.xlsx"))
         if not converted_files:
             raise Exception("Conversion finished but no .xlsx file was created.")
 
-        converted_path = converted_files[0]
-
-        # Read into memory so we can return a file-like object
-        with open(converted_path, "rb") as f:
-            data = f.read()
-
-        return BytesIO(data)
+        with open(converted_files[0], "rb") as f:
+            return BytesIO(f.read())
 
 
 def read_excel_safe(file, sheet_name=None):
     """
-    Try normal engines first, then LibreOffice conversion as last resort.
+    Robust Excel reader with multiple fallbacks.
+    Order:
+      1. Preferred engine (based on extension)
+      2. Alternate engine
+      3. pandas automatic detection (engine=None)
+      4. LibreOffice conversion (if available)
     """
-    # Reset pointer
-    if hasattr(file, "seek"):
-        file.seek(0)
+    preferred = get_preferred_engine(getattr(file, "name", "file.xlsx"))
+    engines_to_try = [preferred]
 
-    engines = ["openpyxl", "xlrd"]
+    # Add the other common engine
+    if preferred == "openpyxl":
+        engines_to_try.append("xlrd")
+    else:
+        engines_to_try.append("openpyxl")
+
+    # Also try pandas auto-detection
+    engines_to_try.append(None)
+
     last_error = None
 
-    # 1. Try normal engines
-    for engine in engines:
+    for engine in engines_to_try:
         try:
             if hasattr(file, "seek"):
                 file.seek(0)
+
             if sheet_name is None:
                 return pd.ExcelFile(file, engine=engine)
             else:
@@ -96,7 +108,7 @@ def read_excel_safe(file, sheet_name=None):
             last_error = e
             continue
 
-    # 2. Try LibreOffice conversion
+    # Last resort → LibreOffice
     try:
         if hasattr(file, "seek"):
             file.seek(0)
@@ -109,7 +121,16 @@ def read_excel_safe(file, sheet_name=None):
     except Exception as e:
         last_error = e
 
-    raise Exception(f"Could not read the file with any method.\nLast error: {last_error}")
+    # Final failure message with advice
+    raise Exception(
+        f"Could not read the file with any method.\n\n"
+        f"Tried: openpyxl → xlrd → auto → LibreOffice\n"
+        f"Last error: {last_error}\n\n"
+        f"**What you can do:**\n"
+        f"1. Open the file in Excel / Google Sheets and **Save As → .xlsx**\n"
+        f"2. Install LibreOffice (`soffice`) so automatic conversion works\n"
+        f"3. Make sure the file is not password-protected or corrupted"
+    )
 
 
 # ---------------- File Uploaders ----------------
@@ -119,23 +140,23 @@ with col1:
     st.subheader("1️⃣ Primary File")
     primary_file = st.file_uploader(
         "Drag & drop or click to upload Primary Excel",
-        type=["xlsx", "xls"],
-        key="primary"
+        type=["xlsx", "xls", "xlsm"],
+        key="primary",
     )
 
 with col2:
     st.subheader("2️⃣ Secondary Files")
     secondary_files = st.file_uploader(
         "Drag & drop or click to upload Secondary Excel(s)",
-        type=["xlsx", "xls"],
+        type=["xlsx", "xls", "xlsm"],
         accept_multiple_files=True,
-        key="secondary"
+        key="secondary",
     )
 
 # ---------------- Main Logic ----------------
 if primary_file is not None:
     try:
-        with st.spinner("Reading / converting file..."):
+        with st.spinner("Reading / converting Primary file..."):
             xl = read_excel_safe(primary_file)
             sheet_names = xl.sheet_names
 
@@ -144,9 +165,9 @@ if primary_file is not None:
         # Sheet selection
         st.subheader("📄 Select Sheet")
         selected_sheet = st.selectbox(
-            "Choose which sheet to use (will be applied to Primary + all Secondary files)",
+            "Choose which sheet to use (applied to Primary + all Secondary files)",
             options=sheet_names,
-            index=0
+            index=0,
         )
 
         primary_df = read_excel_safe(primary_file, sheet_name=selected_sheet)
@@ -165,7 +186,7 @@ if primary_file is not None:
             value_col = st.selectbox(
                 "Value Column (ending column)",
                 all_columns,
-                index=len(all_columns) - 1 if len(all_columns) > 0 else 0
+                index=len(all_columns) - 1 if all_columns else 0,
             )
 
         start_idx = all_columns.index(key_col)
@@ -183,7 +204,6 @@ if primary_file is not None:
                 st.warning("Please upload at least one Secondary file.")
             else:
                 with st.spinner("Merging files..."):
-
                     primary_subset = primary_df[selected_columns].copy()
                     all_dfs = [primary_subset]
                     skipped_files = []
@@ -192,14 +212,19 @@ if primary_file is not None:
                         try:
                             sec_df = read_excel_safe(file, sheet_name=selected_sheet)
 
-                            available_cols = [c for c in selected_columns if c in sec_df.columns]
+                            available_cols = [
+                                c for c in selected_columns if c in sec_df.columns
+                            ]
 
                             if key_col not in available_cols:
-                                skipped_files.append(f"`{file.name}` → Key column missing")
+                                skipped_files.append(
+                                    f"`{file.name}` → Key column `{key_col}` missing"
+                                )
                                 continue
 
                             filtered = sec_df[available_cols].copy()
 
+                            # Ensure every selected column exists
                             for col in selected_columns:
                                 if col not in filtered.columns:
                                     filtered[col] = pd.NA
@@ -216,14 +241,20 @@ if primary_file is not None:
                             st.write(f"- {msg}")
 
                     final_df = pd.concat(all_dfs, ignore_index=True)
-                    final_df = final_df.drop_duplicates(subset=selected_columns, keep="first")
+                    final_df = final_df.drop_duplicates(
+                        subset=selected_columns, keep="first"
+                    )
                     final_df = final_df.sort_values(by=key_col).reset_index(drop=True)
 
-                    st.success(f"✅ Merge complete! **{final_df.shape[0]} rows × {final_df.shape[1]} columns**")
+                    st.success(
+                        f"✅ Merge complete! "
+                        f"**{final_df.shape[0]} rows × {final_df.shape[1]} columns**"
+                    )
 
                     st.subheader("Preview of Merged Data")
                     st.dataframe(final_df, use_container_width=True)
 
+                    # Prepare download
                     buffer = BytesIO()
                     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                         final_df.to_excel(writer, index=False, sheet_name="Merged")
@@ -234,12 +265,17 @@ if primary_file is not None:
                         data=buffer,
                         file_name="merged_result.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
+                        use_container_width=True,
                     )
 
     except Exception as e:
         st.error(f"Error reading Primary file:\n{e}")
-        st.info("Make sure LibreOffice is installed. You can also convert the file manually to .xlsx.")
+        st.info(
+            "Tips:\n"
+            "- Open the file in Excel / Google Sheets and **Save As → .xlsx**\n"
+            "- Install LibreOffice (`soffice`) for automatic conversion of difficult files\n"
+            "- Make sure the file is not password-protected or corrupted"
+        )
 
 else:
     st.info("👆 Please upload a Primary Excel file to begin.")
