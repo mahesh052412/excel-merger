@@ -1,18 +1,22 @@
 import streamlit as st
 import pandas as pd
-from pathlib import Path
-import tempfile
-import os
+from io import BytesIO
 
 st.set_page_config(page_title="Excel Merger", page_icon="📊", layout="wide")
 
 st.title("📊 Excel File Merger")
-st.markdown("Upload one **Primary** file and multiple **Secondary** files. Select two columns — all columns between them will be merged.")
+st.markdown("Upload one **Primary** file and multiple **Secondary** files. Select sheet + two columns — all columns between them will be merged.")
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
-    st.header("Settings")
-    st.info("1. Upload Primary file\n2. Upload Secondary files\n3. Select Key & Value columns\n4. Click Merge")
+    st.header("How to use")
+    st.info("""
+1. Upload Primary Excel file  
+2. Select the Sheet you want  
+3. Upload Secondary Excel file(s)  
+4. Select Key Column & Value Column  
+5. Click **Merge Files**
+""")
 
 # ---------------- File Uploaders ----------------
 col1, col2 = st.columns(2)
@@ -34,14 +38,31 @@ with col2:
         key="secondary"
     )
 
-# ---------------- Column Selection ----------------
+# ---------------- Main Logic ----------------
 if primary_file is not None:
     try:
-        primary_df = pd.read_excel(primary_file)
+        # First read all sheet names from primary file
+        xl = pd.ExcelFile(primary_file)
+        sheet_names = xl.sheet_names
+
+        st.success(f"Primary file loaded successfully")
+        
+        # Sheet selection
+        st.subheader("📄 Select Sheet")
+        selected_sheet = st.selectbox(
+            "Choose which sheet to use (will be applied to Primary + all Secondary files)",
+            options=sheet_names,
+            index=0
+        )
+
+        # Now read the selected sheet
+        primary_df = pd.read_excel(primary_file, sheet_name=selected_sheet)
         all_columns = list(primary_df.columns)
 
-        st.success(f"Primary file loaded → {len(primary_df)} rows | Columns: {all_columns}")
+        st.write(f"**Sheet selected:** `{selected_sheet}` → {len(primary_df)} rows")
+        st.write(f"**Available columns:** {all_columns}")
 
+        # Column selection
         st.subheader("3️⃣ Select Columns")
         col_a, col_b = st.columns(2)
 
@@ -50,7 +71,7 @@ if primary_file is not None:
         with col_b:
             value_col = st.selectbox("Value Column (ending column)", all_columns, index=len(all_columns)-1)
 
-        # Show which columns will be taken
+        # Calculate selected columns range
         start_idx = all_columns.index(key_col)
         end_idx = all_columns.index(value_col)
         if start_idx > end_idx:
@@ -67,18 +88,26 @@ if primary_file is not None:
             else:
                 with st.spinner("Merging files..."):
 
-                    # Primary subset
+                    # Primary data
                     primary_subset = primary_df[selected_columns].copy()
                     all_dfs = [primary_subset]
+
+                    skipped_files = []
 
                     # Process secondary files
                     for file in secondary_files:
                         try:
-                            sec_df = pd.read_excel(file)
+                            # Try to read the same sheet name
+                            sec_df = pd.read_excel(file, sheet_name=selected_sheet)
+                            
                             available_cols = [c for c in selected_columns if c in sec_df.columns]
 
                             if key_col not in available_cols:
-                                st.warning(f"Skipped `{file.name}` — Key column '{key_col}' missing")
+                                skipped_files.append(f"`{file.name}` → Key column '{key_col}' missing")
+                                continue
+
+                            if not available_cols:
+                                skipped_files.append(f"`{file.name}` → No matching columns")
                                 continue
 
                             filtered = sec_df[available_cols].copy()
@@ -91,22 +120,29 @@ if primary_file is not None:
                             filtered = filtered[selected_columns]
                             all_dfs.append(filtered)
 
+                        except ValueError:
+                            skipped_files.append(f"`{file.name}` → Sheet '{selected_sheet}' not found")
                         except Exception as e:
-                            st.error(f"Error reading `{file.name}`: {e}")
+                            skipped_files.append(f"`{file.name}` → Error: {e}")
 
-                    # Combine
+                    # Show skipped files if any
+                    if skipped_files:
+                        st.warning("Some files were skipped:")
+                        for msg in skipped_files:
+                            st.write(f"- {msg}")
+
+                    # Combine everything
                     final_df = pd.concat(all_dfs, ignore_index=True)
                     final_df = final_df.drop_duplicates(subset=selected_columns, keep="first")
                     final_df = final_df.sort_values(by=key_col).reset_index(drop=True)
 
-                    st.success(f"✅ Merge complete! Final shape: **{final_df.shape[0]} rows × {final_df.shape[1]} columns**")
+                    st.success(f"✅ Merge complete! **{final_df.shape[0]} rows × {final_df.shape[1]} columns**")
 
                     # Preview
                     st.subheader("Preview of Merged Data")
                     st.dataframe(final_df, use_container_width=True)
 
-                    # Better way for download:
-                    from io import BytesIO
+                    # Download button
                     buffer = BytesIO()
                     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                         final_df.to_excel(writer, index=False, sheet_name="Merged")
